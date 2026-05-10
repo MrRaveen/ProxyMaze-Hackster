@@ -15,6 +15,14 @@ def init_app(app: Flask):
     Initializes the watch subsystem within the Flask application context.
     """
     global _consumer_process
+    import os
+    
+    # In development mode, Flask runs the app twice (once for the reloader, once for the worker).
+    # We only want to start background processes in the main worker process.
+    if app.debug and os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
+        # Reloader process: don't start background tasks
+        return
+
     with app.app_context():
         print("Initializing Watch subsystem...")
         

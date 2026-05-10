@@ -11,6 +11,8 @@ from sqlalchemy.orm import Session
 
 from app.models.schemas import Alert, Base, CheckResult, Config, Proxy, Webhook, WebhookDelivery
 from config.database import engine, get_session
+from config.redis_client import get_redis_client
+import json
 
 api_bp = Blueprint('api_v1', __name__)
 
@@ -110,10 +112,18 @@ def create_proxies():
             return jsonify({'error': 'each proxy must have id and url'}), 400
 
     with get_session() as session:
+        redis_client = get_redis_client()
+
         if replace:
             session.execute(delete(Proxy))
+            # Flush the Redis live state for the old pool
+            redis_client.delete('proxymaze:state:proxies', 'proxymaze:state:down_count')
+            # Clean up individual live keys
+            for key in redis_client.scan_iter('proxymaze:live:*'):
+                redis_client.delete(key)
 
         created_proxies = []
+        pipe = redis_client.pipeline()
         for p in proxies:
             proxy = Proxy(
                 id=p['id'],
@@ -123,27 +133,55 @@ def create_proxies():
             session.flush()
             session.refresh(proxy)
             created_proxies.append(serialize_proxy(proxy))
+            # Seed initial state in Redis
+            pipe.hset('proxymaze:state:proxies', p['id'], 'pending')
+        pipe.execute()
 
-        return jsonify({'created': len(created_proxies), 'proxies': created_proxies}), 201
+        return jsonify({'accepted': len(created_proxies), 'proxies': created_proxies}), 201
 
 
 @api_bp.route('/proxies', methods=['GET'])
 def list_proxies():
+    redis_client = get_redis_client()
+
+    # Read the live state from the Redis atomic counters (same source as the alert pipeline)
+    live_states = redis_client.hgetall('proxymaze:state:proxies')  # {proxy_id: 'up'/'down'/'pending'}
+    atomic_down_count = int(redis_client.get('proxymaze:state:down_count') or 0)
+
     with get_session() as session:
         statement = select(Proxy).order_by(Proxy.id.asc())
         proxies = session.execute(statement).scalars().all()
 
-        # Calculate up/down/failure_rate
-        up_count = sum(1 for p in proxies if p.status == 'up')
-        down_count = sum(1 for p in proxies if p.status == 'down')
-        failure_rate = down_count / len(proxies) if proxies else 0.0
+        total = len(proxies)
+
+        # Overlay Redis live state onto each proxy for the response
+        proxy_list = []
+        for p in proxies:
+            redis_status = live_states.get(p.id)
+            # Also read the per-proxy live hash for last_checked_at
+            live_data = redis_client.hgetall(f'proxymaze:live:{p.id}')
+
+            proxy_data = serialize_proxy(p)
+            # Override status with the real-time Redis value if available
+            if redis_status:
+                proxy_data['status'] = redis_status
+            # Override last_checked_at with the real-time Redis value if available
+            if live_data.get('checked_at'):
+                proxy_data['last_checked_at'] = live_data['checked_at']
+            proxy_list.append(proxy_data)
+
+        # Calculate up/down from the live Redis states to match the alert pipeline exactly
+        up_count = sum(1 for s in live_states.values() if s == 'up')
+        # Use the atomic down counter — this is the EXACT same value the Lua script uses
+        # to fire/resolve alerts, guaranteeing the API and Alerts tell the same story.
+        failure_rate = atomic_down_count / total if total > 0 else 0.0
 
         return jsonify({
-            'total': len(proxies),
+            'total': total,
             'up': up_count,
-            'down': down_count,
+            'down': atomic_down_count,
             'failure_rate': round(failure_rate, 2),
-            'proxies': [serialize_proxy(p) for p in proxies],
+            'proxies': proxy_list,
         }), 200
 
 
@@ -152,6 +190,15 @@ def delete_proxies():
     with get_session() as session:
         statement = delete(Proxy)
         session.execute(statement)
+
+    # Flush all Redis live state to prevent phantom failure rates
+    redis_client = get_redis_client()
+    redis_client.delete('proxymaze:state:proxies', 'proxymaze:state:down_count')
+    # Clean up individual proxy live-state hashes
+    for key in redis_client.scan_iter('proxymaze:live:*'):
+        redis_client.delete(key)
+    # Drain any pending history buffer entries for deleted proxies
+    redis_client.delete('proxymaze:history_buffer')
 
     return '', 204
 
@@ -279,6 +326,9 @@ def create_webhook():
         return jsonify({'error': 'url is required'}), 400
 
     integration_type = payload.get('integration_type', 'generic')
+    if integration_type in ('slack', 'discord'):
+        return jsonify({'error': f'Integration type {integration_type} is explicitly not supported.'}), 400
+
     username = payload.get('username')
     events = payload.get('events', ['alert.fired', 'alert.resolved'])
 
@@ -296,45 +346,11 @@ def create_webhook():
         session.flush()
 
         return jsonify({
-            'id': webhook.webhook_id,
+            'webhook_id': webhook.webhook_id,
             'url': webhook.url,
             'integration_type': webhook.integration_type,
             'username': webhook.username,
             'events': webhook.events,
-        }), 201
-
-
-@api_bp.route('/integrations', methods=['POST'])
-def create_integration():
-    payload = request.get_json(silent=True) or {}
-    integration_type = payload.get('type')
-    webhook_url = payload.get('webhook_url')
-    username = payload.get('username')
-    events = payload.get('events', [])
-
-    if not integration_type or integration_type not in ('slack', 'discord'):
-        return jsonify({'error': 'type must be either slack or discord'}), 400
-
-    if not webhook_url or not isinstance(webhook_url, str):
-        return jsonify({'error': 'webhook_url is required'}), 400
-
-    if not isinstance(events, list):
-        return jsonify({'error': 'events must be a list'}), 400
-
-    with get_session() as session:
-        webhook = Webhook(
-            url=webhook_url,
-            integration_type=integration_type,
-            username=username,
-            events=events,
-        )
-        session.add(webhook)
-        session.flush()
-
-        return jsonify({
-            'status': 'integrated',
-            'id': webhook.webhook_id,
-            'type': webhook.integration_type,
         }), 201
 
 
@@ -404,16 +420,42 @@ def update_dynamic_config():
         session.add(config)
         session.flush()
 
-        import json
-        from config.redis_client import get_redis_client
-        redis_client = get_redis_client()
-        redis_client.publish('proxymaze:config:updates', json.dumps({
-            'check_interval': interval,
-            'request_timeout_ms': timeout
-        }))
+        try:
+            redis_client = get_redis_client()
+            redis_client.publish('proxymaze:config:updates', json.dumps({
+                'check_interval': interval,
+                'request_timeout_ms': timeout
+            }))
+        except Exception as e:
+            print(f"[API] Failed to publish config update to Redis: {e}")
+            # We don't necessarily want to fail the whole request if Redis pub/sub fails,
+            # but for this challenge, let's keep it strict or at least log it.
 
         return jsonify({
             'status': 'success',
             'check_interval_seconds': config.check_interval_seconds,
             'request_timeout_ms': config.request_timeout_ms,
         }), 200
+
+
+@api_bp.route('/management/scheduler/status', methods=['GET'])
+def scheduler_status():
+    import importlib
+    try:
+        scheduler_mod = importlib.import_module("modules.module-watch.scheduler")
+        scheduler = scheduler_mod.scheduler
+
+        jobs = []
+        for job in scheduler.get_jobs():
+            jobs.append({
+                'id': job.id,
+                'next_run_time': job.next_run_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if job.next_run_time else None,
+                'func': job.func_ref
+            })
+
+        return jsonify({
+            'running': scheduler.running,
+            'jobs': jobs
+        }), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500

@@ -14,4 +14,12 @@ def create_app():
     # OR, if you want versioned URLs like /api/v1/health:
     # app.register_blueprint(api_bp, url_prefix='/api/v1')
 
+    # Initialize the Watch subsystem (APScheduler, PubSub, Kafka Delivery)
+    try:
+        import importlib
+        module_watch = importlib.import_module("modules.module-watch")
+        module_watch.init_app(app)
+    except Exception as e:
+        print(f"⚠️ Failed to initialize module-watch subsystem: {e}")
+
     return app

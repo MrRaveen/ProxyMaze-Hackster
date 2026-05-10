@@ -23,16 +23,46 @@ def get_kafka_producer() -> Producer:
     """
     global _producer
     if _producer is None:
-        bootstrap_servers = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
-        conf = {
-            'bootstrap.servers': bootstrap_servers,
-            'client.id': 'proxymaze-producer',
-            # Add other configurations for acks, retries, etc. if needed
-            'acks': 'all'
-        }
+        dev_status = os.environ.get('dev_status', 'development')
+        
+        if dev_status == 'production':
+            # Cloud (Production) Settings
+            bootstrap_servers = os.environ.get('KAFKA_BOOTSTRAP_SERVERS_PROD')
+            
+            # Resolve cert paths to absolute — relative paths break when the process
+            # working directory differs from the project root.
+            # Anchor to project root (one level up from config/kafka_client.py)
+            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+            
+            def abs_cert(env_var: str) -> str:
+                val = os.environ.get(env_var, '')
+                if val and not os.path.isabs(val):
+                    return os.path.join(project_root, val)
+                return val
+            
+            conf = {
+                'bootstrap.servers': bootstrap_servers,
+                'client.id': 'proxymaze-producer',
+                'acks': 'all',
+                'security.protocol': os.environ.get('KAFKA_SECURITY_PROTOCOL_PROD', 'SSL'),
+                'ssl.ca.location': abs_cert('KAFKA_SSL_CA_LOCATION_PROD'),
+                'ssl.certificate.location': abs_cert('KAFKA_SSL_CERT_LOCATION_PROD'),
+                'ssl.key.location': abs_cert('KAFKA_SSL_KEY_LOCATION_PROD'),
+            }
+            print(f"[Kafka] Using Production (Cloud) Kafka: {bootstrap_servers}")
+        else:
+            # Local (Development) Settings
+            bootstrap_servers = os.environ.get('KAFKA_BOOTSTRAP_SERVERS_LOCAL', 'localhost:9092')
+            conf = {
+                'bootstrap.servers': bootstrap_servers,
+                'client.id': 'proxymaze-producer',
+                'acks': 'all'
+            }
+            print(f"[Kafka] Using Development (Local) Kafka: {bootstrap_servers}")
+
         try:
             _producer = Producer(conf)
-            print(f"Kafka Producer initialized for {bootstrap_servers}")
+            print(f"Kafka Producer initialized successfully.")
         except Exception as e:
             print(f"Failed to initialize Kafka Producer: {e}")
             raise
@@ -45,15 +75,12 @@ def produce_async(topic: str, key: str, value: str):
     """
     producer = get_kafka_producer()
     try:
-        # Produce message
         producer.produce(
             topic=topic,
             key=key.encode('utf-8') if key else None,
             value=value.encode('utf-8'),
             callback=delivery_report
         )
-        # Serve delivery callback queue.
-        # This is required to trigger the delivery_report callback.
         producer.poll(0)
     except BufferError:
         print(f"[Kafka] Local producer queue is full ({len(producer)} messages awaiting delivery): try again")
@@ -63,9 +90,8 @@ def produce_async(topic: str, key: str, value: str):
 def flush_producer():
     """
     Ensure all messages in the producer queue are delivered.
-    Call this on shutdown.
     """
     global _producer
     if _producer is not None:
         print("[Kafka] Flushing producer queue...")
-        _producer.flush(10) # wait up to 10 seconds
+        _producer.flush(10)

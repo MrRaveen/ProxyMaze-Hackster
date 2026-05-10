@@ -66,6 +66,7 @@ def proxy_worker(proxy: Dict, total_pool_size: int):
             from config.kafka_client import produce_async
             import uuid
             import json
+            from datetime import datetime, timezone
             
             client = get_redis_client()
             down_count = int(client.get(DOWN_COUNT_KEY) or 0)
@@ -73,6 +74,8 @@ def proxy_worker(proxy: Dict, total_pool_size: int):
             
             all_states = client.hgetall(PROXY_STATES_KEY)
             failed_proxy_ids = [k for k, v in all_states.items() if v == 'down']
+            now = datetime.now(timezone.utc)
+            fired_at_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
             
             if result == 1:
                 # FIRED
@@ -90,6 +93,7 @@ def proxy_worker(proxy: Dict, total_pool_size: int):
                             alert_id=alert_id,
                             status='active',
                             failure_rate=failure_rate,
+                            fired_at=now,
                             total_proxies=total_pool_size,
                             failed_proxies=down_count,
                             failed_proxy_ids=failed_proxy_ids,
@@ -97,9 +101,10 @@ def proxy_worker(proxy: Dict, total_pool_size: int):
                             message=f"Threshold {THRESHOLD*100}% breached. {down_count}/{total_pool_size} proxies down."
                         )
                         session.add(alert)
-                        session.commit()
+                        # Let context manager handle commit
                 except Exception as db_err:
                     print(f"Error persisting Alert to DB: {db_err}")
+                    import traceback; traceback.print_exc()
                     
             else:
                 # RESOLVED
@@ -112,20 +117,25 @@ def proxy_worker(proxy: Dict, total_pool_size: int):
                 try:
                     from config.database import get_session
                     from app.models.schemas import Alert
-                    from datetime import datetime, timezone
                     with get_session() as session:
                         alert = session.get(Alert, alert_id)
                         if alert:
                             alert.status = 'resolved'
-                            alert.resolved_at = datetime.now(timezone.utc)
-                            session.commit()
+                            alert.resolved_at = now
+                            # Let context manager handle commit
                 except Exception as db_err:
                     print(f"Error resolving Alert in DB: {db_err}")
+                    import traceback; traceback.print_exc()
                 
+            # Kafka payload — must match the GET /alerts record exactly
             payload = {
                 "alert_id": alert_id,
                 "failure_rate": failure_rate,
-                "failed_proxy_ids": failed_proxy_ids
+                "total_proxies": total_pool_size,
+                "failed_proxies": down_count,
+                "failed_proxy_ids": failed_proxy_ids,
+                "threshold": THRESHOLD,
+                "fired_at": fired_at_str
             }
             
             # Asynchronous Produce Pattern

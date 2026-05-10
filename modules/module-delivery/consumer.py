@@ -73,15 +73,54 @@ def start_consumer():
     Starts the Kafka Consumer loop.
     Intended to be run in a separate process.
     """
-    bootstrap_servers = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
+    dev_status = os.environ.get('dev_status', 'development')
     group_id = os.environ.get('KAFKA_GROUP_ID', 'proxymaze-delivery-engine')
     
-    conf = {
-        'bootstrap.servers': bootstrap_servers,
-        'group.id': group_id,
-        'auto.offset.reset': 'earliest',
-        'enable.auto.commit': False # Strict exactly-once semantic control
-    }
+    if dev_status == 'production':
+        bootstrap_servers = os.environ.get('KAFKA_BOOTSTRAP_SERVERS_PROD')
+        
+        # Resolve cert paths to absolute — relative paths break in multiprocessing subprocesses
+        # because the child process may have a different working directory.
+        # We anchor to the project root (two levels up from this file: modules/module-delivery/consumer.py)
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+        
+        def abs_cert(env_var: str) -> str:
+            val = os.environ.get(env_var, '')
+            if val and not os.path.isabs(val):
+                return os.path.join(project_root, val)
+            return val
+        
+        ca_location   = abs_cert('KAFKA_SSL_CA_LOCATION_PROD')
+        cert_location = abs_cert('KAFKA_SSL_CERT_LOCATION_PROD')
+        key_location  = abs_cert('KAFKA_SSL_KEY_LOCATION_PROD')
+        
+        # Validate files exist before handing to librdkafka
+        for label, path in [('CA', ca_location), ('Cert', cert_location), ('Key', key_location)]:
+            if not os.path.isfile(path):
+                print(f"[Delivery Engine] ❌ SSL {label} file not found: {path}")
+                return
+        
+        conf = {
+            'bootstrap.servers': bootstrap_servers,
+            'group.id': group_id,
+            'auto.offset.reset': 'earliest',
+            'enable.auto.commit': False,
+            'security.protocol': os.environ.get('KAFKA_SECURITY_PROTOCOL_PROD', 'SSL'),
+            'ssl.ca.location': ca_location,
+            'ssl.certificate.location': cert_location,
+            'ssl.key.location': key_location,
+        }
+        print(f"[Delivery Engine] Connecting to Production Kafka: {bootstrap_servers}")
+        print(f"[Delivery Engine] Using SSL CA: {ca_location}")
+    else:
+        bootstrap_servers = os.environ.get('KAFKA_BOOTSTRAP_SERVERS_LOCAL', 'localhost:9092')
+        conf = {
+            'bootstrap.servers': bootstrap_servers,
+            'group.id': group_id,
+            'auto.offset.reset': 'earliest',
+            'enable.auto.commit': False
+        }
+        print(f"[Delivery Engine] Connecting to Development Kafka: {bootstrap_servers}")
     
     consumer = Consumer(conf)
     topics = ['alert.fired', 'alert.resolved']
@@ -100,7 +139,6 @@ def start_consumer():
                 if err_code == KafkaError._PARTITION_EOF:
                     continue
                 elif err_code == KafkaError.UNKNOWN_TOPIC_OR_PART:
-                    # Topic doesn't exist yet, wait for producer to create it
                     time.sleep(1)
                     continue
                 else:
@@ -111,30 +149,28 @@ def start_consumer():
             payload = json.loads(msg.value().decode('utf-8'))
             print(f"\n[Delivery Engine] Received {topic} event for Alert ID {payload.get('alert_id')}")
             
-            # Fetch eligible webhooks from DB
             try:
                 with get_session() as session:
                     webhooks = session.query(Webhook).all()
                     
                     for webhook in webhooks:
+                        # Skip explicitly blocked integrations
+                        if webhook.integration_type in ('slack', 'discord'):
+                            print(f"[Delivery Engine] 🚫 Skipping blocked integration type: {webhook.integration_type} for {webhook.url}")
+                            continue
+                            
                         if topic in webhook.events:
-                            # deliver_webhook now handles its own internal logging to DB
                             deliver_webhook(
                                 url=webhook.url, 
                                 payload=payload, 
                                 session=session, 
                                 webhook_id=webhook.webhook_id
                             )
-                            
                     session.commit()
-                    
             except Exception as e:
                 print(f"[Delivery Engine] ❌ Error processing webhooks: {e}")
-                # We do not commit the offset if there's a DB failure,
-                # ensuring we retry this message upon restart.
                 continue
                 
-            # Exactly-Once Guarantee: Commit offset ONLY after all webhooks are processed
             consumer.commit(asynchronous=False)
             print(f"[Delivery Engine] Offset committed for {topic}.")
             
